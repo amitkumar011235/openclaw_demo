@@ -1,0 +1,10 @@
+--------------------- my notes ---------------------------
+
+Tech stack used :
+1. python
+2. google adk in python
+
+
+----------------------------------------------------------------
+Implementation details  : 
+

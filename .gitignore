@@ -1,0 +1,21 @@
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# uv
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
