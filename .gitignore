@@ -5,6 +5,9 @@ venv/
 # Environment variables (contains secrets)
 .env
 
+# Runtime data (SQLite checkpoints and session metadata)
+data/
+
 # Python
 __pycache__/
 *.py[cod]

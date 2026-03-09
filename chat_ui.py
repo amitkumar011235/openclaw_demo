@@ -1,28 +1,22 @@
 """
-chat_ui.py — Streamlit chat interface for testing WebSocket streaming.
+chat_ui.py — Streamlit chat interface with session management.
 
-This app connects to the FastAPI WebSocket endpoint at ws://localhost:8222/ws
-and displays the LLM response in real time, token by token.
-
-How it works:
-  1. User types a question in the chat input box at the bottom.
-  2. The app opens a WebSocket connection to the FastAPI server.
-  3. It sends the query as a plain text frame.
-  4. It reads response chunks as they arrive and displays them live
-     with a typewriter cursor effect.
-  5. When the server sends "[DONE]", streaming stops.
-  6. The connection is closed after each query (simple, stateless).
+Features:
+  - Sidebar lists existing sessions (fetched from the FastAPI backend).
+  - "New Chat" button creates a fresh session.
+  - Clicking a session loads its conversation history from the server.
+  - Messages are streamed token-by-token over WebSocket.
+  - Sessions persist across page refreshes (stored in server-side SQLite).
 
 Usage:
-  Make sure the FastAPI server is running first (.\\dev or python main.py),
-  then in a second terminal:
-
-      streamlit run chat_ui.py
+    streamlit run chat_ui.py
 """
 
 import asyncio
+import json
 import os
 
+import requests
 import streamlit as st
 import websockets
 from dotenv import load_dotenv
@@ -30,91 +24,194 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
-# Config — reads PORT from .env so it matches the FastAPI server.
+# Config
 # ---------------------------------------------------------------------------
 PORT = os.getenv("PORT", "8222")
+BASE_URL = f"http://localhost:{PORT}"
 WS_URL = f"ws://localhost:{PORT}/ws"
 
-# ---------------------------------------------------------------------------
-# Page setup
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="OpenClaw Chat", page_icon="💬")
-st.title("OpenClaw Chat")
-st.caption("Streaming responses from the ADK agent via WebSocket")
 
 # ---------------------------------------------------------------------------
-# Session state — keeps conversation history across Streamlit reruns.
-# Every widget interaction causes Streamlit to rerun the entire script,
-# so we store messages in session_state to persist them.
+# API helpers
 # ---------------------------------------------------------------------------
+def api_list_sessions() -> list[dict]:
+    try:
+        r = requests.get(f"{BASE_URL}/sessions", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def api_create_session() -> dict:
+    r = requests.post(f"{BASE_URL}/sessions", timeout=5)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_get_history(session_id: str) -> list[dict]:
+    try:
+        r = requests.get(f"{BASE_URL}/sessions/{session_id}/history", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+def api_delete_session(session_id: str):
+    try:
+        requests.delete(f"{BASE_URL}/sessions/{session_id}", timeout=5)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="OpenClaw Chat", page_icon="💬", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Session state init
+# ---------------------------------------------------------------------------
+if "current_session" not in st.session_state:
+    st.session_state.current_session = None
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = {}
+if "sessions_list" not in st.session_state:
+    st.session_state.sessions_list = []
+
+
+def refresh_sessions():
+    st.session_state.sessions_list = api_list_sessions()
+
+
+def switch_session(session_id: str):
+    st.session_state.current_session = session_id
+    if session_id not in st.session_state.messages:
+        st.session_state.messages[session_id] = api_get_history(session_id)
+
+
+def new_chat():
+    sess = api_create_session()
+    refresh_sessions()
+    st.session_state.current_session = sess["id"]
+    st.session_state.messages[sess["id"]] = []
+
+
+# Load sessions on first run
+if not st.session_state.sessions_list:
+    refresh_sessions()
+
+# Auto-create a session if none exist
+if not st.session_state.sessions_list:
+    new_chat()
+
+# If no session selected, pick the most recent
+if not st.session_state.current_session and st.session_state.sessions_list:
+    first = st.session_state.sessions_list[0]
+    switch_session(first["id"])
+
 
 # ---------------------------------------------------------------------------
-# Display existing chat history (from previous turns in this session).
+# Sidebar — session management
 # ---------------------------------------------------------------------------
-for msg in st.session_state.messages:
+with st.sidebar:
+    st.title("Sessions")
+
+    if st.button("➕  New Chat", use_container_width=True):
+        new_chat()
+        st.rerun()
+
+    st.divider()
+
+    if st.button("🔄  Refresh", use_container_width=True):
+        refresh_sessions()
+        st.rerun()
+
+    for sess in st.session_state.sessions_list:
+        sid = sess["id"]
+        is_active = sid == st.session_state.current_session
+
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            label = f"**{sess['title']}**" if is_active else sess["title"]
+            if st.button(label, key=f"sess_{sid}", use_container_width=True):
+                switch_session(sid)
+                st.rerun()
+        with col2:
+            if st.button("🗑", key=f"del_{sid}"):
+                api_delete_session(sid)
+                if st.session_state.current_session == sid:
+                    st.session_state.current_session = None
+                st.session_state.messages.pop(sid, None)
+                refresh_sessions()
+                if st.session_state.sessions_list:
+                    switch_session(st.session_state.sessions_list[0]["id"])
+                else:
+                    new_chat()
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main chat area
+# ---------------------------------------------------------------------------
+current = st.session_state.current_session
+if not current:
+    st.info("Create a new chat to get started.")
+    st.stop()
+
+st.title("OpenClaw Chat")
+st.caption(f"Session: `{current}`")
+
+# Ensure messages are loaded
+if current not in st.session_state.messages:
+    st.session_state.messages[current] = api_get_history(current)
+
+# Display chat history
+for msg in st.session_state.messages[current]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
 
 # ---------------------------------------------------------------------------
-# WebSocket streaming function
+# WebSocket streaming
 # ---------------------------------------------------------------------------
-async def stream_from_ws(query: str, placeholder) -> str:
-    """
-    Connect to the FastAPI WebSocket, send the query, and stream
-    the response into the given Streamlit placeholder.
-
-    Args:
-        query:       The user's question to send to the agent.
-        placeholder: An st.empty() element to update with each chunk.
-
-    Returns:
-        The complete response text once streaming finishes.
-    """
+async def stream_from_ws(query: str, session_id: str, placeholder) -> str:
     full_response = ""
-
-    # Open a fresh WebSocket connection for this query.
     async with websockets.connect(WS_URL) as ws:
-        # Send the user's question as a plain text frame.
-        await ws.send(query)
+        payload = json.dumps({"session_id": session_id, "query": query})
+        await ws.send(payload)
 
-        # Read chunks until the server signals completion with "[DONE]".
         async for chunk in ws:
             if chunk == "[DONE]":
                 break
+            # Skip JSON control messages (like session assignment)
+            if chunk.startswith("{"):
+                try:
+                    ctrl = json.loads(chunk)
+                    if ctrl.get("type") == "session":
+                        continue
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
-            # Append the new chunk and update the placeholder in place.
-            # The "▌" character acts as a blinking cursor effect.
             full_response += chunk
             placeholder.markdown(full_response + "▌")
 
-    # Final render without the cursor.
     placeholder.markdown(full_response)
     return full_response
 
 
 # ---------------------------------------------------------------------------
-# Chat input — pinned to the bottom of the page by Streamlit.
-# When the user submits text, this block runs.
+# Chat input
 # ---------------------------------------------------------------------------
 if prompt := st.chat_input("Ask something..."):
-
-    # 1. Show the user's message in the chat.
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages[current].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2. Show the assistant's response with live streaming.
     with st.chat_message("assistant"):
-        # st.empty() creates a single placeholder element that we can
-        # overwrite repeatedly to get the typewriter streaming effect.
         placeholder = st.empty()
+        response = asyncio.run(stream_from_ws(prompt, current, placeholder))
 
-        # Run the async WebSocket call synchronously.
-        # Streamlit doesn't natively support async, so we use asyncio.run().
-        response = asyncio.run(stream_from_ws(prompt, placeholder))
-
-    # 3. Save the complete response to session state for chat history.
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.messages[current].append({"role": "assistant", "content": response})

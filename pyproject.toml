@@ -10,5 +10,8 @@ dependencies = [
     "python-dotenv",
     "streamlit",
     "websockets",
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "requests>=2.32.5",
+    "aiosqlite>=0.22.1",
 ]
 

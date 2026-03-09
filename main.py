@@ -1,45 +1,46 @@
 """
 main.py — FastAPI server entry point.
 
-This module wires together the FastAPI application and the LangChain agent:
-
-  Endpoints:
-    GET  /health  -> simple health-check that returns {"status": "ok"}.
-    POST /run     -> accepts {"query": "..."}, calls the agent, returns the
-                     full response as {"response": "..."}.
-    WS   /ws      -> WebSocket endpoint for real-time streaming.  The client
-                     sends a text message (the query) and receives chunks of
-                     the agent's reply as they are generated, followed by a
-                     "[DONE]" sentinel when the response is complete.
-
-  Startup:
-    1. Loads environment variables from .env (OPENAI_API_KEY, PORT).
-    2. Starts uvicorn on 0.0.0.0:<PORT> (default 8222).
+Endpoints:
+  GET   /health               -> {"status": "ok"}
+  POST  /run                  -> {"response": "..."} (accepts session_id)
+  WS    /ws                   -> streaming via WebSocket (JSON protocol)
+  GET   /sessions             -> list all sessions
+  POST  /sessions             -> create a new session
+  GET   /sessions/{id}        -> get session metadata
+  GET   /sessions/{id}/history -> get conversation history for a session
+  DELETE /sessions/{id}       -> delete a session
+  PATCH /sessions/{id}        -> update session title
 
 Usage:
     python main.py
 """
 
+import json
 import os
 import logging
+from contextlib import asynccontextmanager
+from typing import Optional
 
 import uvicorn
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Load .env FIRST, before importing agent.py.
-# agent.py creates the ChatOpenAI instance at import time, so the
-# OPENAI_API_KEY must already be in the environment by then.
-# ---------------------------------------------------------------------------
 load_dotenv(override=True)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from agent import call_agent, stream_agent
+from agent import call_agent, stream_agent, get_history, init_agent, shutdown_agent
+from sessions import (
+    create_session,
+    list_sessions,
+    get_session,
+    update_title,
+    delete_session,
+)
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -47,96 +48,125 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Lifespan — initialise async resources (SQLite checkpointer) on startup
+# and clean them up on shutdown.
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Initialising agent (async SQLite checkpointer)…")
+    await init_agent()
+    yield
+    logger.info("Shutting down agent checkpointer…")
+    await shutdown_agent()
+
+
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="OpenClaw Demo",
-    description="A simple FastAPI + LangChain agent server using OpenAI GPT-4o.",
+    description="FastAPI + LangChain agent with SQLite-backed session memory.",
+    lifespan=lifespan,
 )
 
 
-# -- Request / response models for the /run endpoint -----------------------
-
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 class RunRequest(BaseModel):
-    """JSON body expected by POST /run."""
     query: str
+    session_id: Optional[str] = None
 
 
 class RunResponse(BaseModel):
-    """JSON body returned by POST /run."""
     response: str
+    session_id: str
+
+
+class SessionOut(BaseModel):
+    id: str
+    title: str
+    created_at: str
+
+
+class TitleUpdate(BaseModel):
+    title: str
 
 
 # ---------------------------------------------------------------------------
-# GET /health — quick liveness probe
+# GET /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    """Return a simple status object so load-balancers or scripts can verify
-    the server is alive."""
     return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
-# POST /run — send a query to the agent and get the full response back
+# POST /run — send a query, get full response (with session memory)
 # ---------------------------------------------------------------------------
 @app.post("/run", response_model=RunResponse)
 async def run_agent(body: RunRequest):
-    """
-    Accept a user query, forward it to the ADK agent, and return the
-    complete text response.
+    """If no session_id is provided, a new session is auto-created."""
+    if body.session_id:
+        sid = body.session_id
+        if not get_session(sid):
+            create_session()
+            sid = body.session_id
+    else:
+        sess = create_session()
+        sid = sess["id"]
 
-    Request body:
-        {"query": "What is Python?"}
-
-    Response body:
-        {"response": "Python is a programming language …"}
-    """
-    logger.info("POST /run  query=%s", body.query)
+    logger.info("POST /run  session=%s  query=%s", sid, body.query)
 
     try:
-        # call_agent() awaits the full LLM response before returning.
-        result = await call_agent(body.query)
+        result = await call_agent(body.query, thread_id=sid)
     except RuntimeError as exc:
         logger.error("Agent error: %s", exc)
-        return RunResponse(response=f"Error: {exc}")
+        return RunResponse(response=f"Error: {exc}", session_id=sid)
 
     logger.info("POST /run  response length=%d chars", len(result))
-    return RunResponse(response=result)
+    return RunResponse(response=result, session_id=sid)
 
 
 # ---------------------------------------------------------------------------
-# WS /ws — streaming WebSocket endpoint
+# WS /ws — streaming WebSocket with session support
+#
+# Protocol (JSON-based):
+#   Client sends:  {"session_id": "abc123", "query": "Hello"}
+#                  session_id is optional — one is auto-created if missing.
+#   Server sends:  text chunks as plain strings, then "[DONE]".
 # ---------------------------------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """
-    WebSocket handler for real-time streaming communication.
-
-    Protocol:
-      1. Client connects to ws://host:port/ws
-      2. Client sends a plain text message (the query).
-      3. Server streams back partial response chunks as plain text frames.
-      4. Server sends the string "[DONE]" to signal end-of-response.
-      5. Client may send another query on the same connection (go to step 2).
-      6. Either side can close the connection at any time.
-    """
     await ws.accept()
     logger.info("WebSocket client connected")
 
     try:
-        # Keep the connection open for multiple query/response rounds.
         while True:
-            # Step 2 — wait for the client to send a query.
-            query = await ws.receive_text()
-            logger.info("WS query=%s", query)
+            raw = await ws.receive_text()
 
-            # Step 3 — stream the agent's response chunk-by-chunk.
-            async for chunk in stream_agent(query):
+            try:
+                payload = json.loads(raw)
+                query = payload.get("query", raw)
+                session_id = payload.get("session_id")
+            except (json.JSONDecodeError, AttributeError):
+                query = raw
+                session_id = None
+
+            if not session_id:
+                sess = create_session()
+                session_id = sess["id"]
+                await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
+            elif not get_session(session_id):
+                create_session()
+
+            logger.info("WS session=%s  query=%s", session_id, query)
+
+            async for chunk in stream_agent(query, thread_id=session_id):
                 await ws.send_text(chunk)
 
-            # Step 4 — tell the client the response is complete.
             await ws.send_text("[DONE]")
             logger.info("WS response streamed, sent [DONE]")
 
@@ -145,7 +175,52 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Entry point — start uvicorn when the script is run directly
+# Session management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/sessions", response_model=list[SessionOut])
+async def api_list_sessions():
+    return list_sessions()
+
+
+@app.post("/sessions", response_model=SessionOut, status_code=201)
+async def api_create_session():
+    return create_session()
+
+
+@app.get("/sessions/{session_id}", response_model=SessionOut)
+async def api_get_session(session_id: str):
+    sess = get_session(session_id)
+    if not sess:
+        from fastapi import HTTPException
+        raise HTTPException(404, "Session not found")
+    return sess
+
+
+@app.get("/sessions/{session_id}/history")
+async def api_get_history(session_id: str):
+    """Return the conversation messages for the given session."""
+    return await get_history(session_id)
+
+
+@app.patch("/sessions/{session_id}", response_model=SessionOut)
+async def api_update_session(session_id: str, body: TitleUpdate):
+    if not update_title(session_id, body.title):
+        from fastapi import HTTPException
+        raise HTTPException(404, "Session not found")
+    return get_session(session_id)
+
+
+@app.delete("/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    if not delete_session(session_id):
+        from fastapi import HTTPException
+        raise HTTPException(404, "Session not found")
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8222"))
