@@ -1,7 +1,7 @@
 """
 main.py — FastAPI server entry point.
 
-This module wires together the FastAPI application and the ADK agent:
+This module wires together the FastAPI application and the LangChain agent:
 
   Endpoints:
     GET  /health  -> simple health-check that returns {"status": "ok"}.
@@ -25,6 +25,14 @@ import logging
 
 import uvicorn
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Load .env FIRST, before importing agent.py.
+# agent.py creates the ChatOpenAI instance at import time, so the
+# OPENAI_API_KEY must already be in the environment by then.
+# ---------------------------------------------------------------------------
+load_dotenv(override=True)
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
@@ -40,18 +48,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Load .env so OPENAI_API_KEY (and optional PORT) are available as env vars.
-# LiteLLM reads OPENAI_API_KEY automatically — we don't need to pass it
-# anywhere in code.
-# ---------------------------------------------------------------------------
-load_dotenv(override=True)
-
-# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="OpenClaw Demo",
-    description="A simple FastAPI + Google ADK agent server using OpenAI GPT-4o.",
+    description="A simple FastAPI + LangChain agent server using OpenAI GPT-4o.",
 )
 
 
