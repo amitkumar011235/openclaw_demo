@@ -26,7 +26,7 @@ load_dotenv(override=True)
 from langchain.agents import create_agent
 from langchain.messages import AIMessageChunk, HumanMessage, AIMessage
 
-from tools import ALL_TOOLS
+from .tools import ALL_TOOLS
 
 # ---------------------------------------------------------------------------
 # Constants

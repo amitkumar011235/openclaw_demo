@@ -12,8 +12,8 @@ Endpoints:
   DELETE /sessions/{id}       -> delete a session
   PATCH /sessions/{id}        -> update session title
 
-Usage:
-    python main.py
+Usage (from project root):
+    uv run uvicorn core.main:app --host 0.0.0.0 --port 8222 --reload
 """
 
 import json
@@ -30,8 +30,8 @@ load_dotenv(override=True)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from agent import call_agent, stream_agent, get_history, init_agent, shutdown_agent
-from sessions import (
+from .agent import call_agent, stream_agent, get_history, init_agent, shutdown_agent
+from .sessions import (
     create_session,
     list_sessions,
     get_session,
@@ -112,8 +112,8 @@ async def run_agent(body: RunRequest):
     if body.session_id:
         sid = body.session_id
         if not get_session(sid):
-            create_session()
-            sid = body.session_id
+            sess = create_session()
+            sid = sess["id"]
     else:
         sess = create_session()
         sid = sess["id"]
@@ -160,7 +160,8 @@ async def websocket_endpoint(ws: WebSocket):
                 session_id = sess["id"]
                 await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
             elif not get_session(session_id):
-                create_session()
+                sess = create_session()
+                session_id = sess["id"]
 
             logger.info("WS session=%s  query=%s", session_id, query)
 
@@ -220,9 +221,9 @@ async def api_delete_session(session_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point (when run as python -m core.main from project root)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8222"))
     logger.info("Starting server on port %d", port)
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("core.main:app", host="0.0.0.0", port=port, reload=False)
