@@ -10,11 +10,16 @@ BaseChannel that knows how to:
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from telegram import Update
+from telegram.error import BadRequest
 
 from .base import BaseChannel
+
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramChannel(BaseChannel):
@@ -50,8 +55,21 @@ class TelegramChannel(BaseChannel):
     async def send_reply(self, raw_event: Update, text: str) -> None:
         """
         Send a reply back to the originating chat.
+
+        We first try with Markdown formatting; if Telegram rejects the message
+        (e.g. because of unbalanced backticks), we fall back to plain text so
+        the user still sees a response instead of nothing.
         """
         chat = raw_event.effective_chat
-        if chat is not None:
+        if chat is None:
+            return
+
+        try:
             await chat.send_message(text, parse_mode="Markdown")
+        except BadRequest as exc:  # e.g. "can't parse entities"
+            logger.warning(
+                "Telegram markdown send failed (%s); retrying without parse_mode.",
+                exc,
+            )
+            await chat.send_message(text)
 

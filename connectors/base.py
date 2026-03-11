@@ -11,8 +11,12 @@ Each concrete connector (Telegram, Slack, WhatsApp, etc.) should:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import logging
 
 from gateway import service as gateway_service
+
+
+logger = logging.getLogger(__name__)
 
 
 class BaseChannel(ABC):
@@ -74,45 +78,60 @@ class BaseChannel(ABC):
 
         stripped = text.strip()
 
-        # Command: /new  -> create a fresh session for this user.
-        if stripped == "/new":
-            session_id = await gateway_service.new_session_for_channel(
-                channel, user_id
-            )
-            await self.send_reply(
-                raw_event,
-                f"Started a new session: `{session_id}`",
-            )
-            return
-
-        # Command: /link <session_id>  -> bind this user to an existing session.
-        if stripped.startswith("/link"):
-            parts = stripped.split(maxsplit=1)
-            if len(parts) == 2:
-                target_session_id = parts[1].strip()
-                ok = await gateway_service.link_channel_to_session(
-                    channel, user_id, target_session_id
+        try:
+            # Command: /new  -> create a fresh session for this user.
+            if stripped == "/new":
+                session_id = await gateway_service.new_session_for_channel(
+                    channel, user_id
                 )
-                if ok:
-                    await self.send_reply(
-                        raw_event,
-                        f"Linked to existing session `{target_session_id}`.",
+                await self.send_reply(
+                    raw_event,
+                    f"Started a new session: `{session_id}`",
+                )
+                return
+
+            # Command: /link <session_id>  -> bind this user to an existing session.
+            if stripped.startswith("/link"):
+                parts = stripped.split(maxsplit=1)
+                if len(parts) == 2:
+                    target_session_id = parts[1].strip()
+                    ok = await gateway_service.link_channel_to_session(
+                        channel, user_id, target_session_id
                     )
+                    if ok:
+                        await self.send_reply(
+                            raw_event,
+                            f"Linked to existing session `{target_session_id}`.",
+                        )
+                    else:
+                        await self.send_reply(
+                            raw_event,
+                            "Sorry, I couldn't find a session with that id.",
+                        )
                 else:
                     await self.send_reply(
                         raw_event,
-                        "Sorry, I couldn't find a session with that id.",
+                        "Usage: /link <session_id>",
                     )
-            else:
-                await self.send_reply(
-                    raw_event,
-                    "Usage: /link <session_id>",
-                )
-            return
+                return
 
-        # Normal user message — route through the gateway to the agent.
-        response = await gateway_service.run_for_channel(
-            channel, user_id, text
-        )
-        await self.send_reply(raw_event, response)
+            # Normal user message — route through the gateway to the agent.
+            response = await gateway_service.run_for_channel(
+                channel, user_id, text
+            )
+            await self.send_reply(raw_event, response)
+        except Exception as exc:  # pragma: no cover - defensive
+            # Make sure the user gets *something* back even if the agent,
+            # tools, or gateway raise an unexpected error.
+            logger.exception(
+                "Error handling message on channel=%s user_id=%s: %s",
+                channel,
+                user_id,
+                exc,
+            )
+            await self.send_reply(
+                raw_event,
+                "Sorry, something went wrong while processing that request. "
+                "Please try again with a shorter or simpler query.",
+            )
 
