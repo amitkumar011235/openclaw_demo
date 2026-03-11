@@ -21,7 +21,7 @@ import sys
 
 from dotenv import load_dotenv
 from telegram import Bot, Update
-from telegram.error import Conflict
+from telegram.error import Conflict, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -111,9 +111,23 @@ def _check_single_instance(token: str) -> None:
         try:
             await bot.get_updates(timeout=1)
         except Conflict:
+            # Definitive signal that another instance is polling right now.
             print(CONFLICT_MSG, file=sys.stderr)
             logger.error(CONFLICT_MSG)
             sys.exit(1)
+        except TimedOut:
+            # Network timeout talking to Telegram. This is usually transient or
+            # local networking; don't block startup, just log and continue.
+            logger.warning(
+                "Pre-flight getUpdates timed out — continuing without "
+                "strict single-instance check."
+            )
+        except Exception as exc:
+            # Any other pre-flight error: log and continue so the main
+            # Application can handle retries.
+            logger.warning(
+                "Pre-flight getUpdates failed (%s); continuing anyway.", exc
+            )
 
     asyncio.run(_check())
 
@@ -140,12 +154,8 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text,
-        )
-    )
+    # Include COMMAND so /new and /link reach handle_text -> base.handle_event
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
     try:
         app.run_polling()
